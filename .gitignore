@@ -1,0 +1,11 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Stray run logs
+*.log
+
+# Throwaway design scratch (2D-vs-3D look comparison)
+mockup.html

@@ -1,0 +1,2 @@
+flask>=3.0
+falkordb>=1.7

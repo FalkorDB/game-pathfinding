@@ -1,0 +1,272 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>FalkorDB · Grid Pathfinding — CCH vs Dijkstra vs A*</title>
+<script src="https://unpkg.com/three@0.149.0/build/three.min.js"></script>
+<script src="/common/grid3d.js"></script>
+<link rel="stylesheet" href="/common/design.css"/>
+<style>#hud{width:280px;}</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="flash"></div>
+
+<div id="hud" class="panel">
+  <h1>Grid Pathfinding</h1>
+  <div class="sub">Left-click to walk · right-click / drag to build walls. Pick the algorithm that finds the path — then drop a wall and watch what each one has to do.</div>
+  <div class="seg" id="algoSeg">
+    <button data-algo="cch" class="on">CCH</button>
+    <button data-algo="dijkstra">Dijkstra</button>
+    <button data-algo="astar">A*</button>
+  </div>
+  <div class="segcap" id="algoCap">Contraction Hierarchies</div>
+
+  <div class="stat"><span>Grid</span><b id="sGrid">–</b></div>
+  <div class="stat"><span>Nodes</span><b id="sNodes">–</b></div>
+  <div class="div"></div>
+  <div id="preproc"></div>
+  <div class="stat q"><span>Route query</span><b id="sQ">–</b></div>
+  <div class="stat"><span>Path</span><b id="sPath">–</b></div>
+
+  <div class="row">
+    <button id="btnCmp">Compare all 3</button>
+    <button id="btnReset">Reset walls</button>
+  </div>
+
+  <div id="cmp">
+    <div class="h">Same query, three algorithms:</div>
+    <table id="cmpTbl"></table>
+    <div class="reb" id="cmpReb"></div>
+  </div>
+
+  <div class="hint">
+    <div><span class="k">Left-click</span> walk here</div>
+    <div><span class="k">Right-click</span> toggle wall</div>
+    <div><span class="k">Right-drag</span> paint walls</div>
+  </div>
+</div>
+
+<div id="legend" class="panel">
+  <div class="li"><span class="sw" style="background:#e9e7df"></span>walkable cell</div>
+  <div class="li"><span class="sw" style="background:#2a2c33"></span>wall</div>
+  <div class="li"><span class="sw" style="background:#7fe3ff"></span>path / character</div>
+</div>
+
+<script>
+// ============================================================================
+//  Config / state
+// ============================================================================
+const ZOOM = 0.86, PAN_X = -0.12;
+let N = 30, activeAlgo = "cch";
+const ALGO_NAME = {cch:"Contraction Hierarchies", dijkstra:"Dijkstra (algo.SPpaths)", astar:"A* (algo.AStar)"};
+const ALGO_SHORT = {cch:"CCH", dijkstra:"Dijkstra", astar:"A*"};
+const state = {
+  walls:new Set(), start:{x:2,y:15}, target:null, path:[],
+  char:{x:2,y:15}, moving:false, segIdx:0, speed:6.5,
+  arcs:0, cchDirty:false,
+};
+const key=(x,y)=>x+","+y;
+const inBounds=(x,y)=>x>=0&&y>=0&&x<N&&y<N;
+const isWall=(x,y)=>state.walls.has(key(x,y));
+
+let chain=Promise.resolve();
+const enqueue=fn=>{const p=chain.then(fn,fn);chain=p.catch(()=>{});return p;};
+const post=(u,b)=>fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}).then(r=>r.json());
+
+function flash(msg,color){const f=document.getElementById('flash');f.textContent=msg;
+  f.style.color=color||'var(--accent)';f.style.opacity=1;
+  clearTimeout(flash._t);flash._t=setTimeout(()=>f.style.opacity=0,1700);}
+
+// ============================================================================
+//  HUD
+// ============================================================================
+function renderPreproc(){
+  const el=document.getElementById('preproc');
+  if(activeAlgo==='cch'){
+    const stale=state.cchDirty?' <span style="color:var(--warn)">(stale)</span>':'';
+    // CREATE CCH INDEX is DDL and exposes no arc/shortcut count, so show a built ✓
+    // (older builds returned an arc count -> still render it if the backend sends one).
+    const idx=(state.arcs==null)?'built ✓':state.arcs.toLocaleString()+' arcs';
+    el.innerHTML=`<div class="stat"><span>CCH index</span><b id="sSc">${idx}${stale}</b></div>`
+      +`<div class="stat big warn"><span>CCH rebuild</span><b id="sCch">${_cchMs||'–'}</b></div>`;
+  }else{
+    el.innerHTML=`<div class="stat big none"><span>Preprocessing</span><b>none needed</b></div>`;
+  }
+}
+let _cchMs="–";
+function setCchMs(ms){_cchMs=(ms==null)?"–":(+ms).toFixed(1)+" ms";renderPreproc();}
+function setQuery(ms){document.getElementById('sQ').textContent=(ms==null)?"–":(+ms).toFixed(2)+" ms";}
+function setPathStat(){
+  if(state.path.length<2){document.getElementById('sPath').textContent="–";return;}
+  let d=0;for(let i=1;i<state.path.length;i++){const a=state.path[i-1],b=state.path[i];d+=Math.hypot(b[0]-a[0],b[1]-a[1]);}
+  document.getElementById('sPath').textContent=(state.path.length-1)+" cells · "+d.toFixed(1);
+}
+
+// ============================================================================
+//  Routing / obstacles (server = FalkorDB)
+// ============================================================================
+function applyRoute(r){
+  state.path=r.cells||[];state.segIdx=state.path.length>1?1:0;state.moving=state.path.length>1;
+  if(r.query_ms!=null) setQuery(r.query_ms);
+  setPathStat();render.refresh();
+}
+function setTarget(x,y){
+  if(!inBounds(x,y)||isWall(x,y))return;
+  state.target={x,y};render.refresh();
+  enqueue(async()=>{
+    const cx=Math.round(state.char.x),cy=Math.round(state.char.y);
+    const r=await fetch(`/route?algo=${activeAlgo}&sx=${cx}&sy=${cy}&tx=${x}&ty=${y}`).then(r=>r.json());
+    state.cchDirty=r.cch_dirty; state.arcs=r.arcs;
+    if(r.cch_rebuild_ms!=null){setCchMs(r.cch_rebuild_ms);flash(`CCH had to rebuild first — ${(+r.cch_rebuild_ms).toFixed(1)} ms`,'var(--warn)');}
+    else renderPreproc();
+    applyRoute(r);
+  });
+}
+function paintCell(x,y,desired){
+  if(!inBounds(x,y)||(x===state.start.x&&y===state.start.y))return;
+  enqueue(async()=>{
+    if(isWall(x,y)===desired)return;
+    const cx=Math.round(state.char.x),cy=Math.round(state.char.y);
+    const body={x,y,algo:activeAlgo};
+    if(state.target){body.sx=cx;body.sy=cy;body.tx=state.target.x;body.ty=state.target.y;}
+    const resp=await post('/obstacle',body);
+    if(resp.error){flash(resp.error,'var(--warn)');return;}
+    if(resp.wall)state.walls.add(key(x,y));else state.walls.delete(key(x,y));
+    render.rebuildWall(x,y);
+    state.cchDirty=resp.cch_dirty;state.arcs=resp.arcs;
+    if(resp.cch_ms!=null){setCchMs(resp.cch_ms);flash(`CCH rebuilt in ${(+resp.cch_ms).toFixed(1)} ms`,'var(--warn)');}
+    else{renderPreproc();if(resp.route&&resp.route.query_ms!=null)flash(`${ALGO_SHORT[activeAlgo]} re-routed in ${(+resp.route.query_ms).toFixed(2)} ms · no rebuild`,'var(--good)');}
+    if(resp.route)applyRoute(resp.route);
+  });
+}
+function switchAlgo(a){
+  activeAlgo=a;
+  [...document.getElementById('algoSeg').children].forEach(b=>b.classList.toggle('on',b.dataset.algo===a));
+  document.getElementById('algoCap').textContent=ALGO_NAME[a];
+  setCchMs(null);setQuery(null);renderPreproc();
+  if(state.target)setTarget(state.target.x,state.target.y);   // re-route with the new algo
+}
+function resetWalls(){
+  enqueue(async()=>{
+    const m=await post('/reset',{});
+    state.walls.clear();N=m.n;state.start=m.start;state.arcs=m.arcs;state.cchDirty=false;
+    render.rebuildAll();setCchMs(m.cch_ms);renderPreproc();
+    // keep the character where it is; only the walls are cleared
+    if(state.target){                                 // was walking -> re-route on the cleared grid
+      const cx=Math.round(state.char.x),cy=Math.round(state.char.y);
+      const r=await fetch(`/route?algo=${activeAlgo}&sx=${cx}&sy=${cy}&tx=${state.target.x}&ty=${state.target.y}`).then(r=>r.json());
+      state.cchDirty=r.cch_dirty;state.arcs=r.arcs;applyRoute(r);
+    }else{state.path=[];state.moving=false;setQuery(null);setPathStat();render.refresh();}
+  });
+}
+function compareAll(){
+  enqueue(async()=>{
+    const cx=Math.round(state.char.x),cy=Math.round(state.char.y);
+    let t=state.target;
+    if(!t){t={x:N-1-state.start.x,y:N-1-state.start.y};}   // default: opposite corner
+    if(isWall(t.x,t.y)){flash('pick a destination first');return;}
+    const d=await fetch(`/compare?sx=${cx}&sy=${cy}&tx=${t.x}&ty=${t.y}`).then(r=>r.json());
+    state.arcs=d.arcs;state.cchDirty=false;
+    if(d.cch_rebuild_ms!=null)setCchMs(d.cch_rebuild_ms);
+    const res=d.results;
+    const order=['cch','dijkstra','astar'].filter(k=>res[k]&&res[k].query_ms!=null);
+    const fastest=Math.min(...order.map(k=>res[k].query_ms));
+    const tbl=document.getElementById('cmpTbl');tbl.innerHTML='';
+    for(const k of order){
+      const ms=res[k].query_ms, rel=ms/fastest;
+      const tr=document.createElement('tr');if(ms===fastest)tr.className='win';
+      tr.innerHTML=`<td>${ALGO_SHORT[k]}</td><td>${ms.toFixed(2)} ms</td><td>${rel<1.05?'fastest':rel.toFixed(1)+'× slower'}</td>`;
+      tbl.appendChild(tr);
+    }
+    document.getElementById('cmpReb').textContent =
+      d.cch_rebuild_ms!=null ? `+ CCH first had to rebuild: ${(+d.cch_rebuild_ms).toFixed(1)} ms` : '';
+    document.getElementById('cmp').style.display='block';
+    renderPreproc();
+  });
+}
+
+// ============================================================================
+//  Movement
+// ============================================================================
+function stepMove(dt){
+  if(!state.moving||state.segIdx>=state.path.length)return;
+  const g=state.path[state.segIdx];
+  const dx=g[0]-state.char.x,dy=g[1]-state.char.y,dist=Math.hypot(dx,dy),move=state.speed*dt;
+  if(dist<=move){state.char.x=g[0];state.char.y=g[1];state.segIdx++;
+    if(state.segIdx>=state.path.length){state.moving=false;state.target=null;render.refresh();}}
+  else{state.char.x+=dx/dist*move;state.char.y+=dy/dist*move;}
+}
+
+// ============================================================================
+//  Renderer — built on the shared Grid3D core (common/grid3d.js)
+// ============================================================================
+function setupRenderer(){
+  const world=Grid3D.create(stage,{nx:N,ny:N,zoom:ZOOM,panX:PAN_X,elevation:56,aimZ:2.5});
+  world.buildGrid(isWall);
+  // the character: a glowing cube that casts light on the board (the protagonist)
+  const charMat=new THREE.MeshStandardMaterial({color:0xdfeef5,emissive:0x7fe3ff,emissiveIntensity:0.32,roughness:0.5});
+  const charMesh=new THREE.Mesh(new THREE.BoxGeometry(0.55,0.55,0.55),charMat);world.scene.add(charMesh);
+  charMesh.add(new THREE.PointLight(0x7fe3ff,0.7,6,2));
+  const lineMat=new THREE.LineBasicMaterial({color:0x7fe3ff,transparent:true,opacity:0.9});let line=null;
+  const ring=new THREE.Mesh(new THREE.TorusGeometry(0.34,0.05,8,24),
+    new THREE.MeshStandardMaterial({color:0x7fe3ff,emissive:0x7fe3ff,emissiveIntensity:0.8}));
+  ring.rotation.x=Math.PI/2;ring.visible=false;world.scene.add(ring);
+  return {
+    resize:()=>world.resize(),
+    rebuildWall:(x,y)=>world.setCell(x,y,isWall(x,y)),
+    rebuildAll:()=>{world.buildGrid(isWall);world.resize();},
+    cellAt:(px,py)=>world.raycastCell(px,py),
+    refresh(){
+      world.tintCells(state.path.length?state.path:[]);
+      if(state.target){ring.position.set(world.wx(state.target.x),0.2,world.wz(state.target.y));ring.visible=true;}
+      else ring.visible=false;
+    },
+    draw(){
+      charMesh.position.set(world.wx(state.char.x),0.42,world.wz(state.char.y));
+      charMat.emissiveIntensity=0.3+0.1*Math.sin(performance.now()/320);
+      if(line){world.scene.remove(line);line.geometry.dispose();line=null;}
+      if(state.path.length>1){const pts=state.path.map(q=>new THREE.Vector3(world.wx(q[0]),0.25,world.wz(q[1])));
+        line=new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),lineMat);world.scene.add(line);}
+      if(ring.visible)ring.rotation.z+=0.02;
+      world.render();
+    }
+  };
+}
+
+// ============================================================================
+//  Input + loop + boot
+// ============================================================================
+const stage=document.getElementById('stage');
+let render=null,painting=null;
+stage.addEventListener('contextmenu',e=>e.preventDefault());
+stage.addEventListener('mousedown',e=>{const c=render.cellAt(e.clientX,e.clientY);
+  if(e.button===0)setTarget(c.x,c.y);
+  else if(e.button===2){if(!inBounds(c.x,c.y))return;painting=!isWall(c.x,c.y);paintCell(c.x,c.y,painting);}});
+stage.addEventListener('mousemove',e=>{if(painting===null)return;const c=render.cellAt(e.clientX,e.clientY);paintCell(c.x,c.y,painting);});
+window.addEventListener('mouseup',()=>painting=null);
+document.getElementById('algoSeg').addEventListener('click',e=>{const b=e.target.closest('button');if(b)switchAlgo(b.dataset.algo);});
+document.getElementById('btnCmp').onclick=compareAll;
+document.getElementById('btnReset').onclick=resetWalls;
+window.addEventListener('resize',()=>render&&render.resize());
+
+let last=performance.now();
+function loop(now){const dt=Math.min((now-last)/1000,0.05);last=now;stepMove(dt);if(render)render.draw();requestAnimationFrame(loop);}
+
+(async function boot(){
+  const m=await fetch('/meta').then(r=>r.json());
+  N=m.n;state.start=m.start;state.char={...m.start};state.arcs=m.arcs;state.cchDirty=m.cch_dirty;
+  state.speed=Math.max(6, N*0.22);                 // scale walk speed with grid size
+  for(const [x,y] of m.walls)state.walls.add(key(x,y));
+  document.getElementById('sGrid').textContent=`${N} × ${N} (${(N*N).toLocaleString()} cells)`;
+  document.getElementById('sNodes').textContent=m.nodes.toLocaleString();
+  document.getElementById('algoCap').textContent=ALGO_NAME[activeAlgo];
+  setCchMs(m.cch_ms);                              // show the initial CCH build cost
+  renderPreproc();
+  render=setupRenderer();render.resize();render.refresh();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
