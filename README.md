@@ -9,6 +9,8 @@ A companion to the [road-network CCH demo](https://github.com/FalkorDB/CCH-demo)
 that one shows CCH *winning* on a real, million-node road network; this one shows
 where CCH is the *wrong* tool.
 
+![FalkorDB grid pathfinding demo — CCH vs Dijkstra vs A\*, routing around a wall on a 30×30 grid](docs/screenshot.jpg)
+
 ## The story this demo tells
 
 > **Road network** (stable, near-planar graph) → **CCH dominates.**
